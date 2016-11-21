@@ -91,6 +91,8 @@ concurrent-replicaset-syncs
 concurrent-resource-quota-syncs
 concurrent-serviceaccount-token-syncs
 concurrent-service-syncs
+config-map
+config-map-namespace
 config-sync-period
 configure-cloud-routes
 conntrack-max
@@ -318,6 +320,7 @@ kubelet-client-certificate
 kubelet-client-key
 kubelet-docker-endpoint
 kubelet-enable-debugging-handlers
+kubelet-flags
 kubelet-host-network-sources
 kubelet-https
 kubelet-kubeconfig
@@ -595,6 +598,7 @@ watch-only
 whitelist-override-label
 windows-line-endings
 www-prefix
+zone-id
 zone-name
 garbage-collector-enabled
 viper-config

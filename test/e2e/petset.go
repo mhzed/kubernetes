@@ -55,9 +55,8 @@ const (
 	mysqlGaleraManifestPath = "test/e2e/testing-manifests/petset/mysql-galera"
 	redisManifestPath       = "test/e2e/testing-manifests/petset/redis"
 	cockroachDBManifestPath = "test/e2e/testing-manifests/petset/cockroachdb"
-	// Should the test restart statefulset clusters?
-	// TODO: enable when we've productionzed bringup of pets in this e2e.
-	restartCluster = false
+	// We don't restart MySQL cluster regardless of restartCluster, since MySQL doesn't handle restart well
+	restartCluster = true
 
 	// Timeout for reads from databases running on pets.
 	readTimeout = 60 * time.Second
@@ -83,9 +82,15 @@ var _ = framework.KubeDescribe("StatefulSet [Slow] [Feature:PetSet]", func() {
 			"baz": "blah",
 		}
 		headlessSvcName := "test"
+		var petMounts, podMounts []api.VolumeMount
+		var ps *apps.StatefulSet
 
 		BeforeEach(func() {
-			By("creating service " + headlessSvcName + " in namespace " + ns)
+			petMounts = []api.VolumeMount{{Name: "datadir", MountPath: "/data/"}}
+			podMounts = []api.VolumeMount{{Name: "home", MountPath: "/home"}}
+			ps = newStatefulSet(psName, ns, headlessSvcName, 2, petMounts, podMounts, labels)
+
+			By("Creating service " + headlessSvcName + " in namespace " + ns)
 			headlessService := createServiceSpec(headlessSvcName, "", true, labels)
 			_, err := c.Core().Services(ns).Create(headlessService)
 			Expect(err).NotTo(HaveOccurred())
@@ -100,10 +105,8 @@ var _ = framework.KubeDescribe("StatefulSet [Slow] [Feature:PetSet]", func() {
 		})
 
 		It("should provide basic identity [Feature:StatefulSet]", func() {
-			By("creating statefulset " + psName + " in namespace " + ns)
-			petMounts := []api.VolumeMount{{Name: "datadir", MountPath: "/data/"}}
-			podMounts := []api.VolumeMount{{Name: "home", MountPath: "/home"}}
-			ps := newStatefulSet(psName, ns, headlessSvcName, 3, petMounts, podMounts, labels)
+			By("Creating statefulset " + psName + " in namespace " + ns)
+			ps.Spec.Replicas = 3
 			setInitializedAnnotation(ps, "false")
 
 			_, err := c.Apps().StatefulSets(ns).Create(ps)
@@ -137,12 +140,10 @@ var _ = framework.KubeDescribe("StatefulSet [Slow] [Feature:PetSet]", func() {
 		})
 
 		It("should handle healthy pet restarts during scale [Feature:PetSet]", func() {
-			By("creating statefulset " + psName + " in namespace " + ns)
-
-			petMounts := []api.VolumeMount{{Name: "datadir", MountPath: "/data/"}}
-			podMounts := []api.VolumeMount{{Name: "home", MountPath: "/home"}}
-			ps := newStatefulSet(psName, ns, headlessSvcName, 2, petMounts, podMounts, labels)
+			By("Creating statefulset " + psName + " in namespace " + ns)
+			ps.Spec.Replicas = 2
 			setInitializedAnnotation(ps, "false")
+
 			_, err := c.Apps().StatefulSets(ns).Create(ps)
 			Expect(err).NotTo(HaveOccurred())
 
@@ -171,6 +172,41 @@ var _ = framework.KubeDescribe("StatefulSet [Slow] [Feature:PetSet]", func() {
 
 			By("Confirming all pets in statefulset are created.")
 			pst.saturate(ps)
+		})
+
+		It("should allow template updates", func() {
+			By("Creating stateful set " + psName + " in namespace " + ns)
+			ps.Spec.Replicas = 2
+
+			ps, err := c.Apps().StatefulSets(ns).Create(ps)
+			Expect(err).NotTo(HaveOccurred())
+
+			pst := statefulSetTester{c: c}
+
+			pst.waitForRunning(ps.Spec.Replicas, ps)
+
+			newImage := newNginxImage
+			oldImage := ps.Spec.Template.Spec.Containers[0].Image
+			By(fmt.Sprintf("Updating stateful set template: update image from %s to %s", oldImage, newImage))
+			Expect(oldImage).NotTo(Equal(newImage), "Incorrect test setup: should update to a different image")
+			_, err = framework.UpdateStatefulSetWithRetries(c, ns, ps.Name, func(update *apps.StatefulSet) {
+				update.Spec.Template.Spec.Containers[0].Image = newImage
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			updateIndex := 0
+			By(fmt.Sprintf("Deleting stateful pod at index %d", updateIndex))
+			pst.deletePetAtIndex(updateIndex, ps)
+
+			By("Waiting for all stateful pods to be running again")
+			pst.waitForRunning(ps.Spec.Replicas, ps)
+
+			By(fmt.Sprintf("Verifying stateful pod at index %d is updated", updateIndex))
+			verify := func(pod *api.Pod) {
+				podImage := pod.Spec.Containers[0].Image
+				Expect(podImage).To(Equal(newImage), fmt.Sprintf("Expected stateful pod image %s updated to %s", podImage, newImage))
+			}
+			pst.verifyPodAtIndex(updateIndex, ps, verify)
 		})
 	})
 
@@ -371,10 +407,15 @@ func (c *clusterAppTester) run() {
 	By("Creating foo:bar in member with index 0")
 	c.pet.write(0, map[string]string{"foo": "bar"})
 
-	if restartCluster {
-		By("Restarting stateful set " + ps.Name)
-		c.tester.restart(ps)
-		c.tester.waitForRunning(ps.Spec.Replicas, ps)
+	switch c.pet.(type) {
+	case *mysqlGaleraTester:
+		// Don't restart MySQL cluster since it doesn't handle restarts well
+	default:
+		if restartCluster {
+			By("Restarting stateful set " + ps.Name)
+			c.tester.restart(ps)
+			c.tester.waitForRunning(ps.Spec.Replicas, ps)
+		}
 	}
 
 	By("Reading value under foo from member with index 2")
@@ -622,13 +663,26 @@ func (p *statefulSetTester) saturate(ps *apps.StatefulSet) {
 }
 
 func (p *statefulSetTester) deletePetAtIndex(index int, ps *apps.StatefulSet) {
-	// TODO: we won't use "-index" as the name strategy forever,
-	// pull the name out from an identity mapper.
-	name := fmt.Sprintf("%v-%v", ps.Name, index)
+	name := getPodNameAtIndex(index, ps)
 	noGrace := int64(0)
 	if err := p.c.Core().Pods(ps.Namespace).Delete(name, &api.DeleteOptions{GracePeriodSeconds: &noGrace}); err != nil {
-		framework.Failf("Failed to delete pet %v for StatefulSet %v: %v", name, ps.Name, ps.Namespace, err)
+		framework.Failf("Failed to delete pet %v for StatefulSet %v/%v: %v", name, ps.Namespace, ps.Name, err)
 	}
+}
+
+type verifyPodFunc func(*api.Pod)
+
+func (p *statefulSetTester) verifyPodAtIndex(index int, ps *apps.StatefulSet, verify verifyPodFunc) {
+	name := getPodNameAtIndex(index, ps)
+	pod, err := p.c.Core().Pods(ps.Namespace).Get(name)
+	Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to get stateful pod %s for StatefulSet %s/%s", name, ps.Namespace, ps.Name))
+	verify(pod)
+}
+
+func getPodNameAtIndex(index int, ps *apps.StatefulSet) string {
+	// TODO: we won't use "-index" as the name strategy forever,
+	// pull the name out from an identity mapper.
+	return fmt.Sprintf("%v-%v", ps.Name, index)
 }
 
 func (p *statefulSetTester) scale(ps *apps.StatefulSet, count int32) error {
@@ -942,7 +996,7 @@ func newStatefulSet(name, ns, governingSvcName string, replicas int32, petMounts
 					Containers: []api.Container{
 						{
 							Name:         "nginx",
-							Image:        "gcr.io/google_containers/nginx-slim:0.7",
+							Image:        nginxImage,
 							VolumeMounts: mounts,
 						},
 					},

@@ -48,6 +48,8 @@ import (
 	"k8s.io/kubernetes/pkg/api/unversioned"
 	"k8s.io/kubernetes/pkg/api/v1"
 	"k8s.io/kubernetes/pkg/apimachinery/registered"
+	"k8s.io/kubernetes/pkg/apis/apps"
+	"k8s.io/kubernetes/pkg/apis/batch"
 	"k8s.io/kubernetes/pkg/apis/extensions"
 	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
 	"k8s.io/kubernetes/pkg/client/clientset_generated/release_1_5"
@@ -437,17 +439,6 @@ func errorBadPodsStates(badPods []api.Pod, desiredPods int, ns, desiredState str
 	return errStr + buf.String()
 }
 
-// check if a Pod is controlled by a Replication Controller in the List
-func hasReplicationControllersForPod(rcs *api.ReplicationControllerList, pod api.Pod) bool {
-	for _, rc := range rcs.Items {
-		selector := labels.SelectorFromSet(rc.Spec.Selector)
-		if selector.Matches(labels.Set(pod.ObjectMeta.Labels)) {
-			return true
-		}
-	}
-	return false
-}
-
 // WaitForPodsSuccess waits till all labels matching the given selector enter
 // the Success state. The caller is expected to only invoke this method once the
 // pods have been created.
@@ -490,9 +481,9 @@ func WaitForPodsSuccess(c clientset.Interface, ns string, successPodLabels map[s
 
 // WaitForPodsRunningReady waits up to timeout to ensure that all pods in
 // namespace ns are either running and ready, or failed but controlled by a
-// replication controller. Also, it ensures that at least minPods are running
-// and ready. It has separate behavior from other 'wait for' pods functions in
-// that it requires the list of pods on every iteration. This is useful, for
+// controller. Also, it ensures that at least minPods are running and
+// ready. It has separate behavior from other 'wait for' pods functions in
+// that it requests the list of pods on every iteration. This is useful, for
 // example, in cluster startup, because the number of pods increases while
 // waiting.
 // If ignoreLabels is not empty, pods matching this selector are ignored and
@@ -517,17 +508,30 @@ func WaitForPodsRunningReady(c clientset.Interface, ns string, minPods int32, ti
 	}()
 
 	if wait.PollImmediate(Poll, timeout, func() (bool, error) {
-		// We get the new list of pods and replication controllers in every
-		// iteration because more pods come online during startup and we want to
-		// ensure they are also checked.
+		// We get the new list of pods, replication controllers, and
+		// replica sets in every iteration because more pods come
+		// online during startup and we want to ensure they are also
+		// checked.
+		replicas, replicaOk := int32(0), int32(0)
+
 		rcList, err := c.Core().ReplicationControllers(ns).List(api.ListOptions{})
 		if err != nil {
 			Logf("Error getting replication controllers in namespace '%s': %v", ns, err)
 			return false, nil
 		}
-		replicas := int32(0)
 		for _, rc := range rcList.Items {
 			replicas += rc.Spec.Replicas
+			replicaOk += rc.Status.ReadyReplicas
+		}
+
+		rsList, err := c.Extensions().ReplicaSets(ns).List(api.ListOptions{})
+		if err != nil {
+			Logf("Error getting replication sets in namespace %q: %v", ns, err)
+			return false, nil
+		}
+		for _, rs := range rsList.Items {
+			replicas += rs.Spec.Replicas
+			replicaOk += rs.Status.ReadyReplicas
 		}
 
 		podList, err := c.Core().Pods(ns).List(api.ListOptions{})
@@ -535,7 +539,7 @@ func WaitForPodsRunningReady(c clientset.Interface, ns string, minPods int32, ti
 			Logf("Error getting pods in namespace '%s': %v", ns, err)
 			return false, nil
 		}
-		nOk, replicaOk := int32(0), int32(0)
+		nOk := int32(0)
 		badPods = []api.Pod{}
 		desiredPods = len(podList.Items)
 		for _, pod := range podList.Items {
@@ -545,18 +549,15 @@ func WaitForPodsRunningReady(c clientset.Interface, ns string, minPods int32, ti
 			}
 			if res, err := testutils.PodRunningReady(&pod); res && err == nil {
 				nOk++
-				if hasReplicationControllersForPod(rcList, pod) {
-					replicaOk++
-				}
 			} else {
 				if pod.Status.Phase != api.PodFailed {
 					Logf("The status of Pod %s is %s (Ready = false), waiting for it to be either Running (with Ready = true) or Failed", pod.ObjectMeta.Name, pod.Status.Phase)
 					badPods = append(badPods, pod)
-				} else if !hasReplicationControllersForPod(rcList, pod) {
-					Logf("Pod %s is Failed, but it's not controlled by a ReplicationController", pod.ObjectMeta.Name)
+				} else if _, ok := pod.Annotations[api.CreatedByAnnotation]; !ok {
+					Logf("Pod %s is Failed, but it's not controlled by a controller", pod.ObjectMeta.Name)
 					badPods = append(badPods, pod)
 				}
-				//ignore failed pods that are controlled by a replication controller
+				//ignore failed pods that are controlled by some controller
 			}
 		}
 
@@ -2456,6 +2457,15 @@ func WaitForAllNodesSchedulable(c clientset.Interface, timeout time.Duration) er
 		// won't install correctly), so we can't expect them to be ready at any point.
 		//
 		// However, we only allow non-ready nodes with some specific reasons.
+		if len(notSchedulable) > 0 {
+			Logf("Unschedulable nodes:")
+			for i := range notSchedulable {
+				Logf("-> %s Ready=%t Network=%t",
+					notSchedulable[i].Name,
+					IsNodeConditionSetAsExpected(notSchedulable[i], api.NodeReady, true),
+					IsNodeConditionSetAsExpected(notSchedulable[i], api.NodeNetworkUnavailable, false))
+			}
+		}
 		if len(notSchedulable) > TestContext.AllowedNotReadyNodes {
 			return false, nil
 		}
@@ -2588,10 +2598,14 @@ func RemoveTaintOffNode(c clientset.Interface, nodeName string, taint api.Taint)
 
 		newTaints, err := deleteTaint(nodeTaints, taint)
 		ExpectNoError(err)
+		if len(newTaints) == 0 {
+			delete(node.Annotations, api.TaintsAnnotationKey)
+		} else {
+			taintsData, err := json.Marshal(newTaints)
+			ExpectNoError(err)
+			node.Annotations[api.TaintsAnnotationKey] = string(taintsData)
+		}
 
-		taintsData, err := json.Marshal(newTaints)
-		ExpectNoError(err)
-		node.Annotations[api.TaintsAnnotationKey] = string(taintsData)
 		_, err = c.Core().Nodes().Update(node)
 		if err != nil {
 			if !apierrs.IsConflict(err) {
@@ -3358,6 +3372,54 @@ func UpdateReplicationControllerWithRetries(c clientset.Interface, namespace, na
 		pollErr = fmt.Errorf("couldn't apply the provided updated to rc %q: %v", name, updateErr)
 	}
 	return rc, pollErr
+}
+
+type updateStatefulSetFunc func(*apps.StatefulSet)
+
+func UpdateStatefulSetWithRetries(c clientset.Interface, namespace, name string, applyUpdate updateStatefulSetFunc) (statefulSet *apps.StatefulSet, err error) {
+	statefulSets := c.Apps().StatefulSets(namespace)
+	var updateErr error
+	pollErr := wait.Poll(10*time.Millisecond, 1*time.Minute, func() (bool, error) {
+		if statefulSet, err = statefulSets.Get(name); err != nil {
+			return false, err
+		}
+		// Apply the update, then attempt to push it to the apiserver.
+		applyUpdate(statefulSet)
+		if statefulSet, err = statefulSets.Update(statefulSet); err == nil {
+			Logf("Updating stateful set %s", name)
+			return true, nil
+		}
+		updateErr = err
+		return false, nil
+	})
+	if pollErr == wait.ErrWaitTimeout {
+		pollErr = fmt.Errorf("couldn't apply the provided updated to stateful set %q: %v", name, updateErr)
+	}
+	return statefulSet, pollErr
+}
+
+type updateJobFunc func(*batch.Job)
+
+func UpdateJobWithRetries(c clientset.Interface, namespace, name string, applyUpdate updateJobFunc) (job *batch.Job, err error) {
+	jobs := c.Batch().Jobs(namespace)
+	var updateErr error
+	pollErr := wait.PollImmediate(10*time.Millisecond, 1*time.Minute, func() (bool, error) {
+		if job, err = jobs.Get(name); err != nil {
+			return false, err
+		}
+		// Apply the update, then attempt to push it to the apiserver.
+		applyUpdate(job)
+		if job, err = jobs.Update(job); err == nil {
+			Logf("Updating job %s", name)
+			return true, nil
+		}
+		updateErr = err
+		return false, nil
+	})
+	if pollErr == wait.ErrWaitTimeout {
+		pollErr = fmt.Errorf("couldn't apply the provided updated to job %q: %v", name, updateErr)
+	}
+	return job, pollErr
 }
 
 // NodeAddresses returns the first address of the given type of each node.
